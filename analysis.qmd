@@ -1,0 +1,220 @@
+---
+title: "bacteria and invasions integration"
+author: "Jorik van Rijn"
+date: "9/29/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import data
+
+```{r, message=F}
+library(gsubfn)
+library(tidyverse)
+filepaths <- list.files("trackmate_data/", full.names = T)
+files <- data.frame(path = filepaths) %>%
+  mutate(samplename = strapplyc(path, "^\\w+\\/(\\S+)-\\w+", simplify = TRUE))
+
+samples <- unique(files$samplename)
+
+```
+
+
+```{r, message=F, error=T, warning=F}
+
+readTrackFiles <- function(samplename) {
+  
+  .formatdf <- function(x) {
+  x <- read_csv(x, show_col_types = FALSE)
+  # print(x[[1,1]])
+  ifelse(x[1,1] == "Label", 
+         x <- slice(x, -1:-3) %>% # IF TRUE, needed for Trackmate v2.0 files.
+           type_convert() %>%
+           mutate(TRACK_ID = as.factor(TRACK_ID)),
+         x <- type_convert(x) %>% # IF FALSE, for Trackmate v1.0 files.
+           mutate(TRACK_ID = as.factor(TRACK_ID)))
+  return(x)
+  }
+  
+  outlist <- list(tracks = file.path("trackmate_data", paste0(samplename, "-tracks.csv")),
+              edges = file.path("trackmate_data", paste0(samplename, "-edges.csv")),
+              spots = file.path("trackmate_data", paste0(samplename, "-spots.csv")),
+              ruffleids = file.path("trackmate_data", paste0(samplename, "-ruffleids.csv")))
+  out <- lapply(outlist[c("tracks", "edges", "spots")], .formatdf)
+  out[["samplename"]] <- samplename
+  out[["ruffleids"]] <- read_csv(outlist[["ruffleids"]]) %>%
+    type_convert() %>%
+    mutate(event = case_when(
+      event == "ruffle" ~ "invasion",
+      TRUE ~ event
+      ),
+      ID = as.character(ID))
+  
+  return(out)
+  
+}
+
+out <- list()
+for (sample in samples) {
+  frames <- readTrackFiles(sample)
+  out[[sample]] <- frames
+}
+
+```
+
+Format the Trackmate object as a data.tree.
+
+```{r}
+makeDataTree <- function(d) {
+
+  # Recursive function to format the pathstring for all leaves and nodes.
+  # For plotting, you technically don't need to include the pathStrings for the nodes. 
+  # However, we need the pathStrings for the nodes to set the height attribute properly.
+  getParentString <- function(d, spot, name = NULL) {
+    
+    if (is.null(name)) {
+      name <- spot
+    }
+    
+    upstream <- d$edges$SPOT_SOURCE_ID[which(d$edges$SPOT_TARGET_ID == spot)]
+    
+    if (upstream %in% d$root$ID) { 
+      return(paste("attachment", name, sep = "/")) 
+      
+    } else if (upstream %in% d$nodes$ID) {
+      name <- paste(upstream, name, sep = "/")
+      return(paste(getParentString(d, spot = upstream, name = name)))
+      
+    } else {
+      return(paste(getParentString(d, spot = upstream, name = name)))
+    }
+  
+  }
+  
+  d$elements <- d$spots %>%
+    filter(TRACK_ID %in% unique(d$spots$TRACK_ID)[1:35]) %>%
+    rowwise() %>%
+    mutate(element = case_when(
+      !(ID %in% d$edges$SPOT_TARGET_ID) ~ "root",
+      length(which(d$edges$SPOT_SOURCE_ID == ID)) > 1 ~ "node",
+      !(ID %in% d$edges$SPOT_SOURCE_ID) ~ "leaf",
+      TRUE ~ NA_character_)) %>%
+    filter(!is.na(element)) %>%
+    select(TRACK_ID, ID, POSITION_T, element) %>%
+    mutate(POSITION_T = as.numeric(POSITION_T),
+           ID = as.character(ID)) %>%
+    group_by(TRACK_ID) %>%
+    mutate(POSITION_T = (POSITION_T - min(POSITION_T))/60)
+  
+  d$root <- filter(d$elements, element == "root")
+  d$nodes <- filter(d$elements, element == "node")
+  d$leaves <- filter(d$elements, element == "leaf")
+  
+  d$dftree <- bind_rows(d$leaves, d$nodes) %>%
+    filter(TRACK_ID != 3) %>%
+    rowwise() %>%
+    # Recursively generate the pathstring of the leaves and nodes.
+    mutate(pathString = getParentString(d, ID)) %>% 
+    # Add fate information.
+    left_join(., d$ruffleids, by = "ID") %>%
+    # Format fate information.
+    mutate(event = case_when( 
+             is.na(event) & element == "leaf" ~ "remains",
+             TRUE ~ event)) %>%
+    # Add POSITION_T for the root.
+    add_row(POSITION_T = 0, pathString = "attachment") 
+
+  return(d)
+  
+}
+
+dftree <- lapply(out, makeDataTree)
+
+# Save dftree
+for (i in 1:length(dftree)) {
+  write_csv(dftree[[i]]$dftree, paste0(names(dftree)[[i]], "-dftree.csv"))
+}
+```
+
+Make data.tree
+
+```{r}
+library(data.tree)
+library(ggdendro)
+
+makeTree <- function(d) {
+  d$tree <- FromDataFrameTable(d$dftree)
+  d$dendrogram <- as.dendrogram(d$tree, heightAttribute = "POSITION_T", center = T)
+  d$ggdend <- dendro_data(d$dendrogram, center = TRUE)
+  d$ggdend$labels <- d$ggdend$labels %>%
+    mutate(label = as.character(label)) %>%
+    left_join(., d$dftree, by = c("label" = "ID"))
+  d$ggdend$segments <- d$ggdend$segments %>%
+    mutate(y = y,
+           yend = yend)
+  d$ggdend$leaf_labels <- d$ggdend$segments %>%
+    select(xend, yend) %>%
+    rename(x = xend) %>%
+    group_by(x) %>%
+    summarise(y = max(yend)) %>%
+    left_join(., select(d$ggdend$labels, x, label, event), by = "x")
+  return(d)
+}
+
+tree <- lapply(dftree, makeTree)
+
+```
+
+Plot the data.tree as dendrogram using stat::dendrogram and ggdendro::ggdendrogram.
+
+```{r}
+library(ggdendro)
+library(dendextend)
+
+drawDendrogram <- function(d){
+  
+  cols <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+  
+  d$dftree <- d$dftree %>%
+    ungroup() %>%
+    mutate(
+      eventcolor = case_when(
+        event == "detach" ~ cols[1],
+        event == "invasion" ~ cols[2],
+        event == "remains" ~ "black",
+        is.na(event) ~ NA_character_),
+      eventshape = case_when(
+        event == "detach" ~ 16,
+        event == "invasion" ~ 16,
+        event == "remains" ~ 1,
+        is.na(event) ~ as.double(NA)),
+      eventsize = case_when(
+        event == "invasion" ~ 1.5,
+        event == "detach" ~ 1.5,
+        event == "remains" ~ 0,
+        is.na(event) ~ as.double(NA)))
+  dend <- d$dendrogram %>%
+    set("leaves_pch", d$dftree$eventshape[which(!is.na(d$dftree$eventshape))]) %>%
+    set("leaves_col", d$dftree$eventcolor[which(!is.na(d$dftree$eventcolor))]) %>%
+    set("leaves_cex", d$dftree$eventsize[which(!is.na(d$dftree$eventsize))]) %>%
+    set("labels", d$dftree$event[which(!is.na(d$dftree$event))]) %>%
+    set("branches_lwd", 1.5) %>%
+    set("labels_cex", 0.5)
+  png(paste0(d$samplename, "-dendrogram.png"), width = 1800, height = 1100, res = 300)
+  plot(dend, center = TRUE, 
+       ylim = c(0,50), ylab = "time from attachment (min)", 
+       horiz = F, leaflab = "none",
+       main = d$samplename, frame.plot = F)
+  abline(h=0, col="grey50", lwd = 3)
+  dev.off()
+  
+}
+
+lapply(tree, drawDendrogram)
+
+```
+
+
